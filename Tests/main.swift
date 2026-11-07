@@ -119,6 +119,19 @@ if attached?.status == 0 {
     print("  跳过  只读 DMG（hdiutil 挂载失败）")
 }
 
+section("多个 App 一起卸载")
+func candidate(_ sub: String) -> RemovalCandidate {
+    RemovalCandidate(url: path(sub), kind: "x", evidence: "x", confidence: .exact, requiresAdmin: false, size: 1, defaultSelected: true)
+}
+let sharedPath = candidate("Library/Application Support/Shared")
+let merged = UninstallEngine.removingSharedPaths([
+    [candidate("Applications/A.app"), sharedPath],
+    [candidate("Applications/B.app"), candidate("Library/Application Support/Shared")],
+])
+check("共用路径只归在先加入的 App 名下", merged[0].count == 2 && merged[1].map(\.url.lastPathComponent) == ["B.app"], "\(merged.map { $0.map(\.url.lastPathComponent) })")
+let nested = UninstallEngine.topLevel([candidate("Applications/A.app"), candidate("Applications/A.app/Contents/Inner.app"), candidate("Applications/AB.app")])
+check("App 包里的项目不单独搬，前缀相同的兄弟不受影响", nested.map(\.url.lastPathComponent) == ["A.app", "AB.app"], "\(nested.map(\.url.lastPathComponent))")
+
 // MARK: - 路径保护
 
 section("路径保护")

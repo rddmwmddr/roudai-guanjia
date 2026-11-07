@@ -11,8 +11,7 @@ struct UninstallView: View {
     @State private var sortAsc = true
     @State private var previewItem: FilePreviewItem?
 
-    private var sortedCandidates: [RemovalCandidate] {
-        let cs = engine.candidates
+    private func sorted(_ cs: [RemovalCandidate]) -> [RemovalCandidate] {
         let s: [RemovalCandidate]
         switch sortKey {
         case .size: s = cs.sorted { ($0.size ?? 0) < ($1.size ?? 0) }
@@ -36,12 +35,16 @@ struct UninstallView: View {
             }
             .frame(maxWidth: .infinity)
         }
+        // 底栏固定在窗口底部：选了多个 App 后列表很长，不能让人滚到最后才能点卸载
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if engine.state == .loaded { footer }
+        }
         .dropDestination(for: URL.self) { urls, _ in
             handleDrop(urls)
         } isTargeted: { isTargeted = $0 }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.application],
-                      allowsMultipleSelection: false) { result in
-            if case let .success(urls) = result, let url = urls.first { engine.load(url) }
+                      allowsMultipleSelection: true) { result in
+            if case let .success(urls) = result { engine.add(urls) }
         }
         .alert("无法扫描", isPresented: Binding(
             get: { engine.errorMessage != nil },
@@ -57,11 +60,12 @@ struct UninstallView: View {
 
     private func handleDrop(_ urls: [URL]) -> Bool {
         guard !engine.isUninstalling else { return false }
-        guard let app = urls.first(where: { $0.pathExtension.lowercased() == "app" }) else {
-            engine.errorMessage = "请拖入一个 .app 应用程序包。"
+        let apps = urls.filter { $0.pathExtension.lowercased() == "app" }
+        guard !apps.isEmpty else {
+            engine.errorMessage = "请拖入 .app 应用程序包。"
             return false
         }
-        engine.load(app)
+        engine.add(apps)
         return true
     }
 
@@ -74,14 +78,18 @@ struct UninstallView: View {
                     .font(.title).foregroundStyle(Brand.blue)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("拖拽卸载").font(.title2.bold())
-                    Text("拖入一个 App，揪出它在系统里的全部残留，逐项确认后干净卸载")
+                    Text("拖入一个或多个 App，揪出它们在系统里的全部残留，逐项确认后干净卸载")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if engine.state == .loaded || engine.state == .empty {
-                    Button { importing = true } label: { Label("换一个", systemImage: "arrow.triangle.2.circlepath") }
-                        .glassButton()
-                        .disabled(engine.isUninstalling)
+                if engine.state == .loaded {
+                    Group {
+                        Button { importing = true } label: { Label("添加 App", systemImage: "plus") }
+                        Button { engine.rescan() } label: { Label("重新扫描", systemImage: "arrow.clockwise") }
+                        Button { engine.reset() } label: { Label("全部移出", systemImage: "xmark") }
+                    }
+                    .glassButton()
+                    .disabled(engine.isUninstalling)
                 }
             }
         }
@@ -97,7 +105,7 @@ struct UninstallView: View {
         case .scanning:
             ScanningAnimation(size: 130, caption: "正在揪出残留……")
                 .frame(maxWidth: .infinity).padding(.vertical, 70)
-        case .loaded, .empty:
+        case .loaded:
             resultArea
         }
     }
@@ -113,7 +121,7 @@ struct UninstallView: View {
                         .foregroundStyle(isTargeted ? Brand.blueDeep : Brand.blue)
                         .scaleEffect(isTargeted ? 1.12 : 1.0)
                         .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isTargeted)
-                    Text("把 App 拖到这里")
+                    Text("把一个或多个 App 拖到这里")
                         .font(.title3.weight(.semibold))
                     Text("或")
                         .font(.callout).foregroundStyle(.secondary)
@@ -155,53 +163,47 @@ struct UninstallView: View {
 
     private var resultArea: some View {
         VStack(spacing: 0) {
-            if let id = engine.identity { identityCard(id) }
-
-            if engine.state == .empty {
-                VStack(spacing: 12) {
-                    Image(systemName: "checkmark.seal.fill").font(.system(size: 40)).foregroundStyle(.green)
-                    Text("没找到这个 App 的残留").foregroundStyle(.secondary)
+            toolbar
+            LazyVStack(spacing: 8) {
+                ForEach(engine.apps) { app in
+                    appGroup(app)
+                        .padding(.top, app.id == engine.apps.first?.id ? 0 : 14)
                 }
-                .frame(maxWidth: .infinity).padding(.vertical, 60)
-            } else {
-                toolbar
-                LazyVStack(spacing: 8) {
-                    ForEach(sortedCandidates) { c in
-                        CandidateRow(candidate: c, isSelected: engine.isSelected(c),
-                                     toggle: { engine.toggle(c) },
-                                     preview: { previewItem = FilePreviewItem(url: c.url) })
-                    }
-                }
-                .padding(16)
-                footer
             }
+            .padding(16)
         }
     }
 
-    private func identityCard(_ id: AppIdentity) -> some View {
+    @ViewBuilder private func appGroup(_ app: UninstallApp) -> some View {
+        identityCard(app)
+        ForEach(sorted(app.candidates)) { c in
+            CandidateRow(candidate: c, isSelected: engine.isSelected(c),
+                         toggle: { engine.toggle(c) },
+                         preview: { previewItem = FilePreviewItem(url: c.url) })
+        }
+    }
+
+    private func identityCard(_ app: UninstallApp) -> some View {
         HStack(spacing: 12) {
-            Group {
-                if let icon = engine.appIcon {
-                    Image(nsImage: icon).resizable()
-                } else {
-                    Image(systemName: "app.dashed").resizable().foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 44, height: 44)
+            Image(nsImage: app.icon).resizable().frame(width: 44, height: 44)
             VStack(alignment: .leading, spacing: 2) {
-                Text(id.appName).font(.headline)
-                Text("Bundle ID：\(id.bundleID ?? "无")  ·  \(id.appURL.path)")
+                Text(app.identity.appName).font(.headline)
+                Text("Bundle ID：\(app.identity.bundleID ?? "无")  ·  \(app.identity.appURL.path)")
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             Spacer()
-            Button { engine.rescan() } label: { Label("重新扫描", systemImage: "arrow.clockwise") }
-                .glassButton()
-                .disabled(engine.isUninstalling)
+            Text("\(app.candidates.count) 项 · \(formatBytes(app.totalSize))")
+                .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+            Button { engine.remove(app) } label: {
+                Image(systemName: "xmark.circle.fill").font(.title3)
+            }
+            .buttonStyle(.borderless).foregroundStyle(.secondary)
+            .help("移出列表")
+            .disabled(engine.isUninstalling)
         }
         .padding(12)
         .glassCard(cornerRadius: 14)
-        .padding([.horizontal, .top], 16)
     }
 
     private var toolbar: some View {
@@ -212,7 +214,7 @@ struct UninstallView: View {
             SortBar(options: [("匹配度", .confidence), ("大小", .size), ("名称", .name), ("类型", .kind)],
                     key: $sortKey, ascending: $sortAsc)
             Spacer()
-            Text("共 \(engine.candidates.count) 项 · \(formatBytes(engine.totalSize))")
+            Text("\(engine.apps.count) 个 App · 共 \(engine.candidates.count) 项 · \(formatBytes(engine.totalSize))")
                 .font(.callout).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 16).padding(.top, 12)

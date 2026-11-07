@@ -1,24 +1,48 @@
 import Foundation
 import AppKit
 
+/// 卸载列表里的一个 App。
+struct UninstallApp: Identifiable {
+    let identity: AppIdentity
+    let icon: NSImage
+    let candidates: [RemovalCandidate]
+
+    var id: String { identity.appURL.path }
+    var totalSize: Int64 { candidates.reduce(0) { $0 + ($1.size ?? 0) } }
+}
+
 @MainActor
 final class UninstallEngine: ObservableObject {
-    enum State: Equatable { case idle, scanning, loaded, empty }
+    enum State: Equatable { case idle, scanning, loaded }
 
-    @Published private(set) var identity: AppIdentity?
-    @Published private(set) var candidates: [RemovalCandidate] = []
+    private struct ScanOutcome: Sendable {
+        let url: URL
+        let result: UninstallScanResult?
+        let error: String?
+    }
+
+    /// 界面显示的列表。两个 App 共用的路径只归在先加入的那个名下。
+    @Published private(set) var apps: [UninstallApp] = []
     @Published var selectedIDs: Set<UUID> = []
     @Published private(set) var state: State = .idle
-    @Published private(set) var appIcon: NSImage?
     @Published private(set) var isUninstalling = false
     @Published var errorMessage: String?
 
-    private var scanWorker: Task<UninstallScanResult, Error>?
+    /// 扫描原始结果。移出某个 App 后，它和别的 App 共用的路径要回到别的 App 名下，所以单独保留。
+    private var scans: [UninstallApp] = [] {
+        didSet {
+            let lists = Self.removingSharedPaths(scans.map(\.candidates))
+            apps = zip(scans, lists).map { UninstallApp(identity: $0.identity, icon: $0.icon, candidates: $1) }
+        }
+    }
+    private var pending: [URL] = []
+    private var scanWorker: Task<[ScanOutcome], Error>?
 
     // MARK: 选择
 
+    var candidates: [RemovalCandidate] { apps.flatMap(\.candidates) }
     var selectedCandidates: [RemovalCandidate] { candidates.filter { selectedIDs.contains($0.id) } }
-    var selectedCount: Int { selectedIDs.count }
+    var selectedCount: Int { selectedCandidates.count }
     var selectedSize: Int64 { selectedCandidates.reduce(0) { $0 + ($1.size ?? 0) } }
     var totalSize: Int64 { candidates.reduce(0) { $0 + ($1.size ?? 0) } }
 
@@ -30,83 +54,137 @@ final class UninstallEngine: ObservableObject {
     func selectNone() { selectedIDs = [] }
     func selectExact() { selectedIDs = Set(candidates.filter { $0.confidence == .exact }.map { $0.id }) }
 
-    // MARK: 扫描
+    // MARK: 列表
 
-    func load(_ url: URL) {
+    /// 把 App 加入列表并扫描。已在列表里的不重复加入，已勾选的不受影响。
+    func add(_ urls: [URL]) {
         guard !isUninstalling else { return }
-
-        // 不能卸载自己：解析符号链接 + 比对 Bundle ID 双重防护
-        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
         let mine = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
-        let targetID = Bundle(url: resolved)?.bundleIdentifier
-        if resolved.path == mine.path || (targetID != nil && targetID == Bundle.main.bundleIdentifier) {
-            errorMessage = "肉呆大管家正在运行，不能把自己作为卸载目标。"
-            return
+        var known = Set(scans.map(\.id) + pending.map(\.path))
+        for url in urls {
+            // 不能卸载自己：解析符号链接 + 比对 Bundle ID 双重防护
+            let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+            let targetID = Bundle(url: resolved)?.bundleIdentifier
+            if resolved.path == mine.path || (targetID != nil && targetID == Bundle.main.bundleIdentifier) {
+                report(["肉呆大管家正在运行，不能把自己作为卸载目标。"])
+            } else if known.insert(resolved.path).inserted {
+                pending.append(resolved)
+            }
         }
+        guard !pending.isEmpty else { return }
 
         scanWorker?.cancel()
         // 状态要在这里同步切换：放进下面的 Task 会晚一拍，紧接着的 reset() 会被它覆盖，界面卡在「扫描中」
         state = .scanning
-        clearResults()
-
-        let worker = Task.detached(priority: .userInitiated) { try UninstallScanner().scan(appURL: resolved) }
+        let targets = pending
+        let worker = Task.detached(priority: .userInitiated) { try Self.scan(targets) }
         scanWorker = worker
 
         Task { @MainActor in
             do {
-                let result = try await worker.value
-                guard scanWorker == worker else { return }   // 已被新扫描取代则丢弃
-                identity = result.identity
-                candidates = result.candidates
-                selectedIDs = Set(result.candidates.filter { $0.defaultSelected }.map { $0.id })
-                appIcon = NSWorkspace.shared.icon(forFile: result.identity.appURL.path)
-                state = result.candidates.isEmpty ? .empty : .loaded
-            } catch is CancellationError {
-                // 被新扫描取代，或用户离开了这一页
+                let outcomes = try await worker.value
+                guard scanWorker == worker else { return }   // 已被新一轮扫描取代则丢弃
+                pending = []
+                var problems: [String] = []
+                for outcome in outcomes {
+                    if let result = outcome.result {
+                        scans.append(UninstallApp(identity: result.identity,
+                                                  icon: NSWorkspace.shared.icon(forFile: result.identity.appURL.path),
+                                                  candidates: result.candidates))
+                        selectedIDs.formUnion(result.candidates.filter(\.defaultSelected).map(\.id))
+                    } else {
+                        let name = outcome.url.deletingPathExtension().lastPathComponent
+                        problems.append("\(name)：\(outcome.error ?? "无法读取")")
+                    }
+                }
+                report(problems)
+                state = scans.isEmpty ? .idle : .loaded
             } catch {
-                guard scanWorker == worker else { return }
-                state = .idle
-                errorMessage = error.localizedDescription
+                // CancellationError：被新一轮扫描取代，或用户离开了这一页
             }
         }
     }
 
-    func rescan() { if let url = identity?.appURL { load(url) } }
+    func remove(_ app: UninstallApp) {
+        guard !isUninstalling, let scan = scans.first(where: { $0.id == app.id }) else { return }
+        selectedIDs.subtract(scan.candidates.map(\.id))
+        scans.removeAll { $0.id == app.id }
+        if scans.isEmpty { state = .idle }
+    }
+
+    func rescan() {
+        let urls = scans.map(\.identity.appURL)
+        reset()
+        add(urls)
+    }
 
     func reset() {
         guard !isUninstalling else { return }
         scanWorker?.cancel()
         scanWorker = nil
-        clearResults()
+        pending = []
+        scans = []
+        selectedIDs = []
         state = .idle
     }
 
-    private func clearResults() {
-        identity = nil; candidates = []; selectedIDs = []; appIcon = nil
+    private func report(_ problems: [String]) {
+        guard !problems.isEmpty else { return }
+        errorMessage = ((errorMessage.map { [$0] } ?? []) + problems).joined(separator: "\n")
+    }
+
+    nonisolated private static func scan(_ urls: [URL]) throws -> [ScanOutcome] {
+        try urls.map { url in
+            do {
+                return ScanOutcome(url: url, result: try UninstallScanner().scan(appURL: url), error: nil)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                return ScanOutcome(url: url, result: nil, error: error.localizedDescription)
+            }
+        }
+    }
+
+    /// 同一个路径只留在最先出现的列表里。
+    nonisolated static func removingSharedPaths(_ lists: [[RemovalCandidate]]) -> [[RemovalCandidate]] {
+        var seen = Set<String>()
+        return lists.map { list in list.filter { seen.insert($0.url.path).inserted } }
+    }
+
+    /// 去掉已经被选中目录包含的项目（比如 App 包里的另一个 App）：父目录搬走后它们不用再单独搬。
+    nonisolated static func topLevel(_ selected: [RemovalCandidate]) -> [RemovalCandidate] {
+        let paths = Set(selected.map(\.url.path))
+        return selected.filter { !CleanPlanner.hasAncestor($0.url.path, in: paths) }
     }
 
     // MARK: 卸载（两步确认 → 退出运行中 App → 后台移废纸篓 → 管理员兜底）
 
     func uninstall() async {
-        guard !isUninstalling, let identity, !selectedCandidates.isEmpty else { return }
+        let chosen = selectedCandidates
+        guard !isUninstalling, !chosen.isEmpty else { return }
+        // 只处理勾选了文件的 App：一项都没勾的不会被要求退出，卸载后也原样留在列表里
+        let chosenIDs = Set(chosen.map(\.id))
+        let involved = apps.filter { app in app.candidates.contains { chosenIDs.contains($0.id) } }
+
         isUninstalling = true
-        let finished = await performUninstall(identity: identity, selected: selectedCandidates)
+        let finished = await performUninstall(apps: involved.map(\.identity), selected: Self.topLevel(chosen))
         isUninstalling = false
         guard finished else { return }
 
-        if PathSafety.itemExists(identity.appURL.path) {
-            load(identity.appURL)
-        } else {
-            clearResults()
-            state = .idle
-        }
+        let involvedIDs = Set(involved.map(\.id))
+        let finishedScans = scans.filter { involvedIDs.contains($0.id) }
+        selectedIDs.subtract(finishedScans.flatMap(\.candidates).map(\.id))
+        scans.removeAll { involvedIDs.contains($0.id) }
+        state = scans.isEmpty ? .idle : .loaded
+        // 本体没有勾选或没搬走的 App 留在列表里，重新扫描看还剩什么
+        add(finishedScans.map(\.identity.appURL).filter { PathSafety.itemExists($0.path) })
     }
 
     /// 返回 false 表示用户中途取消，什么都没动。
-    private func performUninstall(identity: AppIdentity, selected: [RemovalCandidate]) async -> Bool {
-        guard await confirmFirstStep(identity: identity, selected: selected) else { return false }
-        guard await confirmByTyping(identity: identity) else { return false }
-        guard await quitRunningAppIfNeeded(identity: identity) else { return false }
+    private func performUninstall(apps: [AppIdentity], selected: [RemovalCandidate]) async -> Bool {
+        guard await confirmFirstStep(apps: apps, selected: selected) else { return false }
+        guard await confirmByTyping() else { return false }
+        guard await quitRunningAppsIfNeeded(apps) else { return false }
 
         // 普通项：后台线程移入废纸篓，不卡界面
         var part = await Task.detached(priority: .userInitiated) {
@@ -146,7 +224,13 @@ final class UninstallEngine: ObservableObject {
         return await alert.beginSheetModal(for: window)
     }
 
-    private func confirmFirstStep(identity: AppIdentity, selected: [RemovalCandidate]) async -> Bool {
+    /// 弹窗里显示的 App 名单，太多时只列前面几个。
+    private func nameList(_ apps: [AppIdentity]) -> String {
+        let names = apps.prefix(8).map(\.appName).joined(separator: "、")
+        return apps.count > 8 ? "\(names) 等 \(apps.count) 个" : names
+    }
+
+    private func confirmFirstStep(apps: [AppIdentity], selected: [RemovalCandidate]) async -> Bool {
         let size = selected.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
         let adminCount = selected.filter { $0.requiresAdmin }.count
         let riskyCount = selected.filter { $0.confidence != .exact }.count
@@ -155,11 +239,12 @@ final class UninstallEngine: ObservableObject {
             : "此操作不会静默永久删除；需要时可以从废纸篓恢复。"
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "准备卸载 \(identity.appName)"
+        alert.messageText = apps.count == 1 ? "准备卸载 \(apps[0].appName)" : "准备卸载 \(apps.count) 个 App"
+        let names = apps.count == 1 ? "" : "\(nameList(apps))\n\n"
         alert.informativeText = """
-        将把 \(selected.count) 个选中项目移到废纸篓，估算大小 \(formatBytes(size))。
+        \(names)将把 \(selected.count) 个选中项目移到废纸篓，估算大小 \(formatBytes(size))。
 
-        其中 \(adminCount) 项可能需要管理员授权，\(riskyCount) 项不是精确匹配。请确认列表里的每个路径都确实属于这个 App。
+        其中 \(adminCount) 项可能需要管理员授权，\(riskyCount) 项不是精确匹配。请确认列表里的每个路径都确实属于要卸载的 App。
 
         \(recovery)
         """
@@ -168,51 +253,57 @@ final class UninstallEngine: ObservableObject {
         return await present(alert) == .alertFirstButtonReturn
     }
 
-    private func confirmByTyping(identity: AppIdentity) async -> Bool {
+    private func confirmByTyping() async -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "最后确认"
-        alert.informativeText = "请输入应用名称“\(identity.appName)”确认卸载。"
+        alert.informativeText = "请输入“确认”后继续。"
         alert.addButton(withTitle: "确认移到废纸篓")
         alert.addButton(withTitle: "取消")
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.placeholderString = identity.appName
+        input.placeholderString = "确认"
         alert.accessoryView = input
         alert.window.initialFirstResponder = input
         guard await present(alert) == .alertFirstButtonReturn else { return false }
-        guard input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == identity.appName else {
-            await showAlert(title: "名称不匹配", message: "已取消卸载。")
+        guard input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == "确认" else {
+            await showAlert(title: "输入不正确", message: "没有输入“确认”，已取消卸载。")
             return false
         }
         return true
     }
 
-    private func quitRunningAppIfNeeded(identity: AppIdentity) async -> Bool {
-        guard !runningApplications(for: identity).isEmpty else { return true }
+    private func quitRunningAppsIfNeeded(_ apps: [AppIdentity]) async -> Bool {
+        let running = apps.filter { !runningApplications(for: $0).isEmpty }
+        guard !running.isEmpty else { return true }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "\(identity.appName) 正在运行"
-        alert.informativeText = "卸载前需要先退出该 App。是否现在请求它退出？"
+        alert.messageText = "\(nameList(running)) 正在运行"
+        alert.informativeText = "卸载前需要先退出。是否现在请求退出？"
         alert.addButton(withTitle: "退出后继续")
         alert.addButton(withTitle: "取消")
         guard await present(alert) == .alertFirstButtonReturn else { return false }
 
-        for app in runningApplications(for: identity) { app.terminate() }
+        for identity in running {
+            for app in runningApplications(for: identity) { app.terminate() }
+        }
         // 异步等待最多 8 秒（不再用嵌套 RunLoop 阻塞主线程）
+        var stillRunning = running
         for _ in 0..<40 {
-            if runningApplications(for: identity).isEmpty { return true }
+            stillRunning = running.filter { !runningApplications(for: $0).isEmpty }
+            if stillRunning.isEmpty { return true }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        guard runningApplications(for: identity).isEmpty == false else { return true }
 
         let force = NSAlert()
         force.alertStyle = .critical
-        force.messageText = "\(identity.appName) 没有正常退出"
+        force.messageText = "\(nameList(stillRunning)) 没有正常退出"
         force.informativeText = "是否强制退出后继续？未保存的内容可能丢失。"
         force.addButton(withTitle: "强制退出并继续")
         force.addButton(withTitle: "取消")
         guard await present(force) == .alertFirstButtonReturn else { return false }
-        for app in runningApplications(for: identity) { app.forceTerminate() }
+        for identity in stillRunning {
+            for app in runningApplications(for: identity) { app.forceTerminate() }
+        }
         return true
     }
 
