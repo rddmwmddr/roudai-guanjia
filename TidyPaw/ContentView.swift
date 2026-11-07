@@ -40,26 +40,25 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { engine.scanAll() } label: { Label("全部扫描", systemImage: "magnifyingglass") }
-                    .disabled(engine.isScanning)
+                    .disabled(engine.isScanning || engine.isCleaning)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { showCleanConfirm = true } label: {
-                    Label(engine.totalSelectedCount > 0 ? "清理 \(formatBytes(engine.totalSelectedSize))" : "清理选中",
-                          systemImage: "trash")
+                    Label(cleanButtonTitle, systemImage: "trash")
                 }
-                .disabled(engine.totalSelectedCount == 0 || engine.isScanning)
+                .disabled(overview.selectedCount == 0 || engine.isScanning || engine.isCleaning)
             }
         }
         // 强制工具栏背景常驻，让标题栏留白恒定，避免切换详情时侧栏内容滑到红绿灯下"跳一下"
         .toolbarBackground(.visible, for: .windowToolbar)
         .confirmationDialog(
-            "确认清理 \(engine.totalSelectedCount) 项，约 \(formatBytes(engine.totalSelectedSize))？",
+            "确认清理 \(overview.selectedCount) 项，约 \(formatBytes(overview.selectedSize))？",
             isPresented: $showCleanConfirm, titleVisibility: .visible
         ) {
             Button("移到废纸篓并清理", role: .destructive) { engine.cleanSelected() }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("除「废纸篓」分类是永久清空外，其余项目都会先移入废纸篓，可随时恢复。")
+            Text(cleanConfirmMessage)
         }
         .alert(item: $engine.lastCleanSummary) { summary in
             Alert(title: Text("清理完成"), message: Text(cleanMessage(summary)), dismissButton: .default(Text("好")))
@@ -85,8 +84,31 @@ struct ContentView: View {
         }
     }
 
+    private var overview: ScanOverview { engine.overview }
+
+    private var cleanButtonTitle: String {
+        if engine.isCleaning { return "正在清理…" }
+        return overview.selectedCount > 0 ? "清理 \(formatBytes(overview.selectedSize))" : "清理选中"
+    }
+
+    private var cleanConfirmMessage: String {
+        let permanent = overview.permanentCount
+        guard permanent > 0 else { return "这些项目会移入废纸篓，可随时恢复。" }
+        return "其中 \(permanent) 项来自废纸篓，将被永久删除，不可恢复；其余项目会移入废纸篓，可随时恢复。"
+    }
+
     private func cleanMessage(_ s: CleanSummary) -> String {
-        var lines = ["已处理 \(s.removed) 项，释放约 \(formatBytes(s.freed))。"]
+        var lines: [String] = []
+        if s.trashedCount > 0 {
+            // 移到废纸篓不腾空间，不能说成「释放」
+            lines.append("已把 \(s.trashedCount) 项（\(formatBytes(s.trashedBytes))）移到废纸篓，清空废纸篓后才会腾出这些空间。")
+        }
+        if s.deletedCount > 0 {
+            lines.append("已永久删除 \(s.deletedCount) 项，腾出 \(formatBytes(s.deletedBytes))。")
+        }
+        if s.keptForSafety > 0 {
+            lines.append("有 \(s.keptForSafety) 个重复文件没有动：它们保留的那一份也被选中或已经不在了，全部删掉就一份都不剩了。")
+        }
         if s.failed > 0 {
             lines.append("有 \(s.failed) 项未能清理（可能需要在「系统设置 › 隐私与安全性 › 完全磁盘访问权限」中授权肉呆大管家）。")
         }
@@ -156,6 +178,9 @@ struct SidebarRow<Content: View>: View {
             .contentShape(Rectangle())
             .onTapGesture { action() }
             .onHover { hover = $0 }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+            .accessibilityAction { action() }
     }
 }
 
@@ -239,7 +264,9 @@ struct CategoryRowContent: View {
         case .scanning:
             Text("扫描中…").font(.caption).foregroundStyle(.secondary)
         case .done:
-            if category.items.isEmpty {
+            if category.items.isEmpty, let issue = category.issue {
+                Text(issue.shortLabel).font(.caption).foregroundStyle(.orange)
+            } else if category.items.isEmpty {
                 Text("没有可清理项").font(.caption).foregroundStyle(.secondary)
             } else {
                 Text("\(category.items.count) 项 · \(formatBytes(category.totalSize))")

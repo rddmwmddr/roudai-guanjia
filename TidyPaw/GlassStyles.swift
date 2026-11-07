@@ -13,9 +13,21 @@ enum Brand {
 // MARK: - 全局背景（暖色渐变，让玻璃材质更通透）
 
 struct AppBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// 深色模式下文字是白的，浅色的奶油渐变会让它们看不清，要换一组深色
+    private var colors: [Color] {
+        if colorScheme == .dark {
+            return [Color(red: 0.12, green: 0.13, blue: 0.15),
+                    Color(red: 0.10, green: 0.17, blue: 0.18),
+                    Color(red: 0.09, green: 0.15, blue: 0.23)]
+        }
+        return [Brand.cream, Brand.mint.opacity(0.35), Brand.blue.opacity(0.18)]
+    }
+
     var body: some View {
         LinearGradient(
-            colors: [Brand.cream, Brand.mint.opacity(0.35), Brand.blue.opacity(0.18)],
+            colors: colors,
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )

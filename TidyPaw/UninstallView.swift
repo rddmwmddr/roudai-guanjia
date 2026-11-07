@@ -56,6 +56,7 @@ struct UninstallView: View {
     }
 
     private func handleDrop(_ urls: [URL]) -> Bool {
+        guard !engine.isUninstalling else { return false }
         guard let app = urls.first(where: { $0.pathExtension.lowercased() == "app" }) else {
             engine.errorMessage = "请拖入一个 .app 应用程序包。"
             return false
@@ -80,6 +81,7 @@ struct UninstallView: View {
                 if engine.state == .loaded || engine.state == .empty {
                     Button { importing = true } label: { Label("换一个", systemImage: "arrow.triangle.2.circlepath") }
                         .glassButton()
+                        .disabled(engine.isUninstalling)
                 }
             }
         }
@@ -195,6 +197,7 @@ struct UninstallView: View {
             Spacer()
             Button { engine.rescan() } label: { Label("重新扫描", systemImage: "arrow.clockwise") }
                 .glassButton()
+                .disabled(engine.isUninstalling)
         }
         .padding(12)
         .glassCard(cornerRadius: 14)
@@ -221,11 +224,11 @@ struct UninstallView: View {
             Text("已选 \(engine.selectedCount) 项 · 约 \(formatBytes(engine.selectedSize))")
             Spacer()
             Button { Task { await engine.uninstall() } } label: {
-                Label("卸载选中项", systemImage: "trash")
+                Label(engine.isUninstalling ? "正在卸载…" : "卸载选中项", systemImage: "trash")
                     .padding(.horizontal, 6).padding(.vertical, 2)
             }
             .glassButton(prominent: true)
-            .disabled(engine.selectedCount == 0)
+            .disabled(engine.selectedCount == 0 || engine.isUninstalling)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
         .background(.bar)

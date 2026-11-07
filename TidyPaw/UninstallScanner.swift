@@ -42,10 +42,14 @@ struct UninstallScanResult: Sendable {
 enum UninstallError: LocalizedError {
     case notApp
     case noBundle
+    case systemApp
+    case readOnlyVolume
     var errorDescription: String? {
         switch self {
-        case .notApp:   return "请拖入一个 .app 应用程序包。"
-        case .noBundle: return "无法读取这个应用的 Info.plist。"
+        case .notApp:         return "请拖入一个 .app 应用程序包。"
+        case .noBundle:       return "无法读取这个应用的 Info.plist。"
+        case .systemApp:      return "这是 macOS 系统自带的应用，受系统保护，不能卸载。"
+        case .readOnlyVolume: return "这个应用在只读磁盘（比如打开的 .dmg 安装映像）上，无法移动。请把映像推出；已经安装到「应用程序」的话，请拖入那一份。"
         }
     }
 }
@@ -61,26 +65,37 @@ final class UninstallScanner {
         seenPaths.removeAll()
         candidates.removeAll()
 
-        let standardizedURL = appURL.standardizedFileURL
+        // 先解析符号链接：拖入的可能是指向 App 的链接，只删链接会留下 App 本体、却删掉它的数据
+        let standardizedURL = appURL.resolvingSymlinksInPath().standardizedFileURL
         guard standardizedURL.pathExtension.lowercased() == "app" else { throw UninstallError.notApp }
+        guard !standardizedURL.path.hasPrefix("/System/") else { throw UninstallError.systemApp }
+        if (try? standardizedURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly == true {
+            throw UninstallError.readOnlyVolume
+        }
         guard let bundle = Bundle(url: standardizedURL) else { throw UninstallError.noBundle }
 
-        let displayName =
-            bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
-            ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+        // Info.plist 里的名字不可信，都要过 isSafeComponent 才能拼路径；文件名兜底，所以 appName 一定非空。
+        func safeString(_ key: String) -> String? {
+            guard let raw = bundle.object(forInfoDictionaryKey: key) as? String else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return PathSafety.isSafeComponent(trimmed) ? trimmed : nil
+        }
+        let displayName = safeString("CFBundleDisplayName")
+            ?? safeString("CFBundleName")
             ?? standardizedURL.deletingPathExtension().lastPathComponent
-        let executableName = bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String
-        let rawBundleID = bundle.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bundleID = (rawBundleID?.isEmpty == true) ? nil : rawBundleID
         let identity = AppIdentity(appURL: standardizedURL, appName: displayName,
-                                   bundleID: bundleID, executableName: executableName)
+                                   bundleID: safeString("CFBundleIdentifier"),
+                                   executableName: safeString("CFBundleExecutable"))
 
         addIfExists(standardizedURL, kind: "应用本体", evidence: "你拖入的应用程序包",
                     confidence: .exact, requiresAdmin: !userCanRemove(standardizedURL),
                     defaultSelected: true)
 
+        try Task.checkCancellation()
         scanUserLibrary(identity: identity)
+        try Task.checkCancellation()
         scanSystemLibrary(identity: identity)
+        try Task.checkCancellation()
         scanReceipts(identity: identity)
 
         let sorted = candidates.sorted { lhs, rhs in
@@ -124,10 +139,12 @@ final class UninstallScanner {
         }
 
         for name in names {
+            let generic = isGenericName(name)
             for base in ["Application Support", "Caches", "Logs"] {
                 addIfExists(library.appendingPathComponent(base, isDirectory: true).appendingPathComponent(name),
-                            kind: kindName(for: base), evidence: "目录名与 App 名称完全一致",
-                            confidence: .exact, requiresAdmin: false, defaultSelected: true)
+                            kind: kindName(for: base),
+                            evidence: generic ? "目录名是通用名称「\(name)」，可能属于其他 App，请确认" : "目录名与 App 名称完全一致",
+                            confidence: generic ? .likely : .exact, requiresAdmin: false, defaultSelected: !generic)
             }
         }
 
@@ -139,7 +156,8 @@ final class UninstallScanner {
             }
         }
 
-        let normalizedNames = Set(names.map(normalized))
+        // 全是符号的名字（比如 emoji）归一化后是空串，不能拿来匹配，否则会配中所有同样的目录
+        let normalizedNames = Set(names.map(normalized)).subtracting([""])
         addMatches(in: library.appendingPathComponent("Group Containers", isDirectory: true),
                    kind: "共享容器", evidence: "名称与 App 名称一致；请确认不是其他 App 共用",
                    confidence: .likely, requiresAdmin: false, defaultSelected: false) { name in
@@ -169,9 +187,11 @@ final class UninstallScanner {
         }
 
         for name in names {
+            let generic = isGenericName(name)
             addIfExists(library.appendingPathComponent("Application Support", isDirectory: true).appendingPathComponent(name),
-                        kind: "系统级应用数据", evidence: "系统级目录名与 App 名称完全一致",
-                        confidence: .exact, requiresAdmin: true, defaultSelected: false)
+                        kind: "系统级应用数据",
+                        evidence: generic ? "目录名是通用名称「\(name)」，可能属于其他 App，请确认" : "系统级目录名与 App 名称完全一致",
+                        confidence: generic ? .likely : .exact, requiresAdmin: true, defaultSelected: false)
         }
     }
 
@@ -193,7 +213,8 @@ final class UninstallScanner {
     private func addIfExists(_ url: URL, kind: String, evidence: String,
                              confidence: MatchConfidence, requiresAdmin: Bool, defaultSelected: Bool) {
         let standardizedURL = url.standardizedFileURL
-        guard fm.fileExists(atPath: standardizedURL.path) else { return }
+        guard PathSafety.itemExists(standardizedURL.path) else { return }
+        guard !PathSafety.isProtected(standardizedURL) else { return }
         guard seenPaths.insert(standardizedURL.path).inserted else { return }
         candidates.append(RemovalCandidate(
             url: standardizedURL, kind: kind, evidence: evidence, confidence: confidence,
@@ -261,7 +282,18 @@ private func unique<T: Hashable>(_ values: [T]) -> [T] {
     return values.filter { seen.insert($0).inserted }
 }
 
-func confidenceLabel(_ c: MatchConfidence) -> String { c.rawValue }
+/// 这些名字太通用，同名目录很可能属于别的 App（Electron 壳、AppleScript 小程序、厂商共用目录），
+/// 只按名字匹配时不能算精确，也不能默认勾选。
+private let genericNames: Set<String> = [
+    "app", "applet", "bin", "cache", "caches", "client", "common", "data", "droplet", "electron",
+    "game", "helper", "java", "launcher", "logs", "main", "node", "nwjs", "player", "python", "run",
+    "server", "shared", "stub", "support", "temp", "tmp", "tool", "tools", "updater", "wrapper",
+    "adobe", "apple", "google", "jetbrains", "microsoft", "mozilla", "tencent",
+]
+
+func isGenericName(_ name: String) -> Bool {
+    genericNames.contains(name.lowercased())
+}
 
 func kindName(for base: String) -> String {
     switch base {

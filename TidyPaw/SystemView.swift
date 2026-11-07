@@ -23,12 +23,11 @@ enum SysSection: String, CaseIterable, Identifiable {
 
 @MainActor
 final class PrivacyEngine: ObservableObject {
-    @Published private(set) var battery: BatteryInfo?
-    @Published private(set) var batteryChecked = false
+    @Published private(set) var battery: BatteryReading?
     @Published private(set) var uploaders: [NetProc] = []
     @Published private(set) var diskProcs: [DiskProc] = []
     @Published private(set) var persistence: [PersistItem] = []
-    @Published private(set) var btPowered = false
+    @Published private(set) var btPowered: Bool?
     @Published private(set) var btDevices: [BTDevice] = []
     /// 正在扫描的板块集合：允许多板块并发，切板块不会丢请求（否则电池会卡在"正在读取…"）
     @Published private(set) var scanning: Set<SysSection> = []
@@ -38,8 +37,8 @@ final class PrivacyEngine: ObservableObject {
 
     func reload(_ s: SysSection) {
         guard !scanning.contains(s) else { return }   // 仅去重同一板块的并发请求
+        scanning.insert(s)   // 同步置位：onAppear 和 onChange 可能在同一拍里各调一次
         Task { @MainActor in
-            scanning.insert(s)
             switch s {
             case .network:
                 uploaders = await Task.detached(priority: .userInitiated) { NetworkScanner.topUploaders() }.value
@@ -52,7 +51,6 @@ final class PrivacyEngine: ObservableObject {
                 btPowered = r.powered; btDevices = r.devices
             case .battery:
                 battery = await Task.detached(priority: .userInitiated) { BatteryReader.read() }.value
-                batteryChecked = true
             }
             loaded.insert(s)
             scanning.remove(s)
@@ -254,9 +252,9 @@ struct SystemView: View {
     private var bluetoothSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Image(systemName: engine.btPowered ? "wave.3.right" : "wave.3.right.slash")
-                    .foregroundStyle(engine.btPowered ? Brand.blue : .secondary)
-                Text("蓝牙：\(engine.btPowered ? "已开启" : "已关闭")").font(.headline)
+                Image(systemName: engine.btPowered == true ? "wave.3.right" : "wave.3.right.slash")
+                    .foregroundStyle(engine.btPowered == true ? Brand.blue : .secondary)
+                Text(bluetoothStatus).font(.headline)
             }
             let connected = engine.btDevices.filter { $0.connected }
             let paired = engine.btDevices.filter { !$0.connected }
@@ -275,6 +273,14 @@ struct SystemView: View {
         }
     }
 
+    private var bluetoothStatus: String {
+        switch engine.btPowered {
+        case true?:  return "蓝牙：已开启"
+        case false?: return "蓝牙：已关闭"
+        case nil:    return "蓝牙：读不到状态"
+        }
+    }
+
     private func btRow(_ d: BTDevice) -> some View {
         HStack(spacing: 10) {
             Circle().fill(d.connected ? Color.green : Color.secondary).frame(width: 8, height: 8)
@@ -288,7 +294,8 @@ struct SystemView: View {
     // MARK: 电池
 
     @ViewBuilder private var batterySection: some View {
-        if let b = engine.battery {
+        switch engine.battery {
+        case .info(let b):
             VStack(spacing: 16) {
                 VStack(spacing: 6) {
                     Text("电池健康").font(.callout).foregroundStyle(.secondary)
@@ -310,9 +317,11 @@ struct SystemView: View {
                 }
                 .padding(.horizontal, 16).padding(.vertical, 4).glassCard(cornerRadius: 16)
             }
-        } else if engine.batteryChecked {
+        case .noBattery:
             emptyHint("没有检测到电池（台式 Mac 没有内置电池）")
-        } else {
+        case .unreadable:
+            emptyHint("这台 Mac 有电池，但系统没有提供健康数据")
+        case nil:
             emptyHint("正在读取…")
         }
     }

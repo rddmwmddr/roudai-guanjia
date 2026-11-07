@@ -116,15 +116,6 @@ enum CategoryGroup: String, CaseIterable, Identifiable {
         case .apps:        return "app.badge"
         }
     }
-
-    var hint: String {
-        switch self {
-        case .systemJunk:  return "缓存、日志、废纸篓——可放心清理，应用会自动重建"
-        case .development: return "Xcode 编译产物与调试文件——下次编译/连真机会重新生成"
-        case .personal:    return "你的下载、大文件、重复文件——请逐项确认后再清理"
-        case .apps:        return "已卸载应用留下的残留数据"
-        }
-    }
 }
 
 // MARK: - 单个文件 / 文件夹条目
@@ -135,13 +126,16 @@ struct FileItem: Identifiable, Hashable, Sendable {
     let size: Int64
     let modified: Date
     let isDirectory: Bool
+    /// 仅重复文件有：这份副本对应的「保留那一份」的路径
+    let keeperPath: String?
 
-    init(url: URL, size: Int64, modified: Date, isDirectory: Bool) {
+    init(url: URL, size: Int64, modified: Date, isDirectory: Bool, keeperPath: String? = nil) {
         self.id = UUID()
         self.url = url
         self.size = size
         self.modified = modified
         self.isDirectory = isDirectory
+        self.keeperPath = keeperPath
     }
 
     var name: String { url.lastPathComponent }
@@ -156,23 +150,58 @@ enum ScanState: Equatable {
     case done       // 扫完
 }
 
+/// 扫描没能得出可靠结果的原因。没有它的话，读不了目录和目录是空的看起来一样，界面会误报「很干净」。
+enum ScanIssue: Equatable, Sendable {
+    case needsFullDiskAccess
+    case inventoryUnavailable
+
+    var message: String {
+        switch self {
+        case .needsFullDiskAccess:
+            return "没有权限读取这里的内容，所以这里的结果不完整。请在「系统设置 › 隐私与安全性 › 完全磁盘访问权限」里打开肉呆大管家，再重新扫描。"
+        case .inventoryUnavailable:
+            return "这次没能拿到已安装应用的清单，无法判断哪些是残留，所以没有列出任何项目。请稍后重新扫描。"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .needsFullDiskAccess:  return "需要磁盘访问权限"
+        case .inventoryUnavailable: return "未能判断"
+        }
+    }
+}
+
+struct ScanOutcome: Sendable {
+    let items: [FileItem]
+    let issue: ScanIssue?
+}
+
+enum FileSortKey: Hashable { case size, name, date, type }
+
 final class ScanCategory: ObservableObject, Identifiable {
     let kind: CategoryKind
     var id: CategoryKind { kind }
 
-    @Published var items: [FileItem] = []
+    @Published var items: [FileItem] = [] {
+        didSet {
+            totalSize = items.reduce(0) { $0 + $1.size }
+            sortCache = nil
+        }
+    }
     @Published var selectedIDs: Set<UUID> = []
     @Published var state: ScanState = .idle
+    @Published var issue: ScanIssue?
     /// 每个条目的类型/用途说明，扫描时在后台一次性算好
-    @Published var purposes: [UUID: FilePurpose] = [:]
+    @Published var purposes: [UUID: FilePurpose] = [:] {
+        didSet { sortCache = nil }
+    }
+
+    /// items 改变时算好：侧边栏每次刷新都要读，不值得每次重新累加
+    private(set) var totalSize: Int64 = 0
+    private var sortCache: (key: FileSortKey, ascending: Bool, items: [FileItem])?
 
     init(kind: CategoryKind) { self.kind = kind }
-
-    var totalSize: Int64 { items.reduce(0) { $0 + $1.size } }
-    var selectedSize: Int64 {
-        items.reduce(0) { $0 + (selectedIDs.contains($1.id) ? $1.size : 0) }
-    }
-    var selectedCount: Int { selectedIDs.count }
 
     func isSelected(_ item: FileItem) -> Bool { selectedIDs.contains(item.id) }
 
@@ -183,15 +212,44 @@ final class ScanCategory: ObservableObject, Identifiable {
 
     func selectAll()  { selectedIDs = Set(items.map { $0.id }) }
     func selectNone() { selectedIDs = [] }
+
+    /// 排好序的列表。结果会缓存：勾选一项不该让几千个文件名重新做一遍本地化比较。
+    func sortedItems(by key: FileSortKey, ascending: Bool) -> [FileItem] {
+        if let cache = sortCache, cache.key == key, cache.ascending == ascending { return cache.items }
+        let sorted: [FileItem]
+        switch key {
+        case .size:
+            sorted = items.sorted { $0.size < $1.size }
+        case .date:
+            sorted = items.sorted { $0.modified < $1.modified }
+        case .name:
+            sorted = items.map { ($0, $0.name) }
+                .sorted { $0.1.localizedStandardCompare($1.1) == .orderedAscending }
+                .map { $0.0 }
+        case .type:
+            sorted = items.sorted { a, b in
+                let ta = purposes[a.id]?.typeLabel ?? ""
+                let tb = purposes[b.id]?.typeLabel ?? ""
+                if ta != tb { return ta.localizedStandardCompare(tb) == .orderedAscending }
+                return a.size > b.size
+            }
+        }
+        let result = ascending ? sorted : Array(sorted.reversed())
+        sortCache = (key, ascending, result)
+        return result
+    }
 }
 
 // MARK: - 清理结果汇总
 
 struct CleanSummary: Identifiable {
     let id = UUID()
-    let freed: Int64
-    let removed: Int
+    let trashedCount: Int      // 移到废纸篓（可恢复，空间要清空废纸篓后才腾出来）
+    let trashedBytes: Int64
+    let deletedCount: Int      // 从废纸篓永久删除（空间真正腾出来）
+    let deletedBytes: Int64
     let failed: Int
+    let keptForSafety: Int     // 重复文件：保留的那份也被选中或已不在，这份不动
 }
 
 // MARK: - 通用格式化

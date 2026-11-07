@@ -11,8 +11,8 @@ final class PermissionsEngine: ObservableObject {
 
     func scan() {
         guard state != .scanning else { return }
+        state = .scanning   // 同步置位，连点两下不会启动两次
         Task { @MainActor in
-            state = .scanning
             let result = await Task.detached(priority: .userInitiated) { PermissionsScanner.scan() }.value
             apps = result.apps
             state = result.readable ? .loaded : .needsAccess

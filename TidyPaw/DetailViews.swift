@@ -71,9 +71,10 @@ struct DiskDetailView: View {
         return min(max(Double(used) / Double(engine.diskTotal), 0), 1)
     }
     private var scannedGroups: [(group: CategoryGroup, size: Int64)] {
-        CategoryGroup.allCases.compactMap { g in
-            let size = engine.categories.filter { $0.kind.group == g }.reduce(Int64(0)) { $0 + $1.totalSize }
-            return size > 0 ? (g, size) : nil
+        let totals = engine.overview.groupTotals
+        return CategoryGroup.allCases.compactMap { g in
+            guard let size = totals[g], size > 0 else { return nil }
+            return (g, size)
         }
     }
 
@@ -113,7 +114,7 @@ struct DiskDetailView: View {
                 HStack {
                     Image(systemName: "sparkles").foregroundStyle(Brand.blue)
                     Text("已扫描出可清理约 ")
-                    Text(formatBytes(engine.totalReclaimable)).bold().foregroundStyle(Brand.blue)
+                    Text(formatBytes(engine.overview.reclaimable)).bold().foregroundStyle(Brand.blue)
                     Spacer()
                 }
                 .font(.callout)
@@ -148,25 +149,7 @@ struct DiskDetailView: View {
     }
 }
 
-// MARK: - 工具占位（接入中）
-
-struct ToolPlaceholder: View {
-    let icon: String
-    let title: String
-    let subtitle: String
-    var body: some View {
-        VStack(spacing: 16) {
-            ScanningAnimation(size: 110)
-            Text(title).font(.title2.bold())
-            Text(subtitle).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
 // MARK: - 单个分类详情
-
-enum FileSortKey: Hashable { case size, name, date, type }
 
 struct CategoryDetailView: View {
     @ObservedObject var engine: ScanEngine
@@ -174,24 +157,6 @@ struct CategoryDetailView: View {
     @State private var sortKey: FileSortKey = .size
     @State private var sortAsc = false
     @State private var previewItem: FilePreviewItem?
-
-    private var sortedItems: [FileItem] {
-        let items = category.items
-        let s: [FileItem]
-        switch sortKey {
-        case .size: s = items.sorted { $0.size < $1.size }
-        case .name: s = items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        case .date: s = items.sorted { $0.modified < $1.modified }
-        case .type:
-            s = items.sorted { a, b in
-                let ta = category.purposes[a.id]?.typeLabel ?? ""
-                let tb = category.purposes[b.id]?.typeLabel ?? ""
-                if ta != tb { return ta.localizedStandardCompare(tb) == .orderedAscending }
-                return a.size > b.size
-            }
-        }
-        return sortAsc ? s : s.reversed()
-    }
 
     var body: some View {
         // 根用 ScrollView，保证 NavigationSplitView 侧栏顶部留白稳定（切到此页不"跳"）
@@ -225,7 +190,7 @@ struct CategoryDetailView: View {
                 } label: {
                     Label(category.state == .done ? "重新扫描" : "扫描", systemImage: "arrow.clockwise")
                 }
-                .disabled(engine.isScanning)
+                .disabled(engine.isScanning || engine.isCleaning)
             }
 
             Text(category.kind.subtitle)
@@ -265,12 +230,18 @@ struct CategoryDetailView: View {
             ScanningAnimation(size: 120, caption: "正在扫描 \(category.kind.title)…")
                 .frame(maxWidth: .infinity).padding(.vertical, 70)
         case .done:
+            if let issue = category.issue {
+                ScanIssueBanner(issue: issue).padding(.horizontal, 16).padding(.top, 12)
+            }
             if category.items.isEmpty {
-                placeholder(icon: "checkmark.circle", text: "很干净，没有发现可清理的项目")
+                // 读不了目录时不能说「很干净」：那只是没看到，不是没有
+                if category.issue == nil {
+                    placeholder(icon: "checkmark.circle", text: "很干净，没有发现可清理的项目")
+                }
             } else {
                 // 用 LazyVStack 而非 List：避免嵌在根 ScrollView 里造成双层滚动
                 LazyVStack(spacing: 6) {
-                    ForEach(sortedItems) { item in
+                    ForEach(category.sortedItems(by: sortKey, ascending: sortAsc)) { item in
                         FileRow(item: item,
                                 purpose: category.purposes[item.id],
                                 isSelected: category.isSelected(item),
@@ -337,6 +308,24 @@ struct WarningBanner: View {
     }
 }
 
+// MARK: - 扫描结果不完整时的提示
+
+struct ScanIssueBanner: View {
+    let issue: ScanIssue
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            WarningBanner(text: issue.message)
+            if issue == .needsFullDiskAccess {
+                Button { openFullDiskAccessSettings() } label: {
+                    Label("去系统设置授权", systemImage: "gearshape")
+                }
+                .glassButton()
+            }
+        }
+    }
+}
+
 // MARK: - 类型小标签
 
 struct TypeBadge: View {
@@ -378,7 +367,7 @@ struct FileRow: View {
                     }
                 }
                 // 优先显示「用途/来源」说明；没算出来时退回显示路径
-                Text(purpose?.explanation.isEmpty == false ? purpose!.explanation : item.path)
+                Text(purpose.flatMap { $0.explanation.isEmpty ? nil : $0.explanation } ?? item.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -402,8 +391,12 @@ struct FileRow: View {
         }
         .contentShape(Rectangle())
         .help(item.path)   // 悬停看完整路径
-        .onTapGesture(count: 2) { FileActions.revealInFinder(item.url) }
-        .onTapGesture { toggle() }
+        .onTapGesture {
+            // 只挂一个手势、再看点击次数：同时挂单击和双击手势时，单击要等双击判定超时才响应，勾选会慢半拍。
+            // 双击等于 toggle 两次，勾选状态回到原样。
+            toggle()
+            if NSApp.currentEvent?.clickCount == 2 { FileActions.revealInFinder(item.url) }
+        }
         .padding(.vertical, 2)
         .contextMenu {
             Button {

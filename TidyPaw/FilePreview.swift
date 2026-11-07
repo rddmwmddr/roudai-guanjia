@@ -20,7 +20,10 @@ struct QuickLookPreview: NSViewRepresentable {
         return view
     }
     func updateNSView(_ nsView: QLPreviewView, context: Context) {
-        nsView.previewItem = url as NSURL
+        // 只在换了文件时才赋值：每次重新赋值都会重载预览，播放中的视频会跳回开头
+        if (nsView.previewItem as? NSURL) as URL? != url {
+            nsView.previewItem = url as NSURL
+        }
     }
     // sheet 关闭时主动停掉预览，释放 QL 资源，避免视频/大图遗留
     static func dismantleNSView(_ nsView: QLPreviewView, coordinator: ()) {

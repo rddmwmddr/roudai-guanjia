@@ -14,8 +14,7 @@ struct WeChatBucket: Identifiable, Sendable {
     let label: String
     let count: Int             // 该类文件总数
     let size: Int64            // 该类总大小
-    let files: [WeChatFile]    // 该类中最大的若干个（可能少于 count，见 isTruncated）
-    var isTruncated: Bool { count > files.count }
+    let files: [WeChatFile]    // 该类中最大的若干个（可能少于 count）
 }
 
 struct WeChatResult: Sendable {
@@ -29,20 +28,27 @@ enum WeChatScanner {
     static var candidateRoots: [URL] {
         let h = FileManager.default.homeDirectoryForCurrentUser
         return [
+            h.appendingPathComponent("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"),  // 微信 4.x
             h.appendingPathComponent("Library/Group Containers/5A4RE8SF68.com.tencent.xinWeChat"),
             h.appendingPathComponent("Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat"),
             h.appendingPathComponent("Library/Application Support/com.tencent.xinWeChat"),
         ]
     }
 
-    /// 探测：(存在的根, 是否至少有一个可读)。可读 = 能列目录（没被 TCC 挡住）。
+    /// 探测：(存在的根, 是否全部可读)。可读 = 能列目录（没被 TCC 挡住）。
+    /// 有一个读不了就算不可读：微信 4.x 的数据全在受保护的 xwechat_files 里，
+    /// 只统计旧目录会给出一个小得离谱的总数。
     static func probe() -> (roots: [URL], readable: Bool) {
         let fm = FileManager.default
         var roots: [URL] = []
-        var readable = false
+        var seen = Set<String>()
+        var readable = true
         for r in candidateRoots where fm.fileExists(atPath: r.path) {
-            roots.append(r)
-            if (try? fm.contentsOfDirectory(atPath: r.path)) != nil { readable = true }
+            // 其中一个可能是指向另一个的符号链接，解析后去重，否则会重复统计
+            let resolved = r.resolvingSymlinksInPath()
+            guard seen.insert(resolved.path).inserted else { continue }
+            roots.append(resolved)
+            if (try? fm.contentsOfDirectory(atPath: resolved.path)) == nil { readable = false }
         }
         return (roots, readable)
     }
@@ -126,8 +132,8 @@ enum WeChatScanner {
         default:
             guard let ct else { return "其他" }
             if ct.conforms(to: .image) { return "图片" }
+            if ct.conforms(to: .audio) { return "音频" }   // 要排在视频前：public.audio 也符合 audiovisualContent
             if ct.conforms(to: .movie) || ct.conforms(to: .audiovisualContent) { return "视频" }
-            if ct.conforms(to: .audio) { return "音频" }
             if ct.conforms(to: .pdf) || ct.conforms(to: .text) || ct.conforms(to: .spreadsheet) { return "文档" }
             return "其他"
         }

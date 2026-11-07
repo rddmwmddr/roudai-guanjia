@@ -39,10 +39,11 @@ enum FileClassifier {
 
         guard let ct else { return item.isDirectory ? "文件夹" : "文件" }
 
-        // 顺序重要：磁盘镜像要排在压缩包前面（.dmg 同时符合两者）
+        // 顺序重要：音频要排在视频前面（public.audio 也符合 audiovisualContent，反过来所有音频都会被判成视频）；
+        // 磁盘镜像要排在压缩包前面（.dmg 同时符合两者）
+        if ct.conforms(to: .audio) { return "音频" }
         if ct.conforms(to: .movie) || ct.conforms(to: .audiovisualContent) { return "视频" }
         if ct.conforms(to: .image) { return "图片" }
-        if ct.conforms(to: .audio) { return "音频" }
         if ct.conforms(to: .diskImage) { return "磁盘镜像" }
         if ["pkg", "ipa", "mpkg"].contains(ext)
             || ct.identifier.contains("installer-package")
@@ -99,7 +100,10 @@ enum FileClassifier {
         case .largeFiles:
             return "\(rootFolderCN(for: item.url))中的大\(type)（\(formatBytes(item.size))）"
         case .duplicates:
-            return "与其他文件内容完全相同的重复\(type)（已保留另一份）"
+            if let keeper = item.keeperPath {
+                return "与 \((keeper as NSString).abbreviatingWithTildeInPath) 内容完全相同的重复\(type)，清理时保留那一份"
+            }
+            return "与其他文件内容完全相同的重复\(type)"
 
         case .appLeftovers:
             return "疑似已卸载应用的残留：\(leftoverKindCN(for: item.url))，移到废纸篓可恢复"
@@ -134,10 +138,8 @@ enum FileClassifier {
         return url.deletingPathExtension().lastPathComponent
     }
 
-    /// 反向 DNS 形状：首段以字母开头、≥3 段、无空段。
-    /// 锚定写法可排除版本号（8.0.1）、".a.b"、"a..b" 这类会被误当成残留的字符串。
     static func looksLikeBundleID(_ s: String) -> Bool {
-        s.range(of: "^[A-Za-z][A-Za-z0-9-]*(\\.[A-Za-z0-9_-]+){2,}$", options: .regularExpression) != nil
+        LeftoverScanner.looksLikeBundleID(s)
     }
 
     /// DerivedData 文件夹名形如 <工程名>-<28位小写hash>，只剥掉结尾的 -hash
@@ -149,12 +151,14 @@ enum FileClassifier {
         return proj.isEmpty ? nil : proj   // 仅有 hash 的文件夹 → 当共享缓存处理，不显示 工程「」
     }
 
-    /// 大文件根目录的中文名
+    /// 大文件根目录的中文名。只看 Home 下的第一段：~/Documents/Movies/x.mov 属于「文稿」。
     static func rootFolderCN(for url: URL) -> String {
         let map = ["Desktop": "桌面", "Documents": "文稿", "Downloads": "下载",
                    "Movies": "影片", "Music": "音乐", "Pictures": "图片"]
-        for (en, cn) in map where url.path.contains("/\(en)/") { return cn }
-        return "个人目录"
+        let homeParts = FileScanner.home.standardizedFileURL.pathComponents
+        let parts = url.standardizedFileURL.pathComponents
+        guard parts.count > homeParts.count, parts.starts(with: homeParts) else { return "个人目录" }
+        return map[parts[homeParts.count]] ?? "个人目录"
     }
 
     /// 残留文件按它所在的 Library 子目录给出种类

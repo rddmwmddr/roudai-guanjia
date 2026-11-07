@@ -4,7 +4,7 @@ import Foundation
 ///
 /// 安全原则（来自真机核实）：
 /// - 只把结果当作**候选**，全部默认不勾选，由用户逐项确认。
-/// - 拿不到「已安装应用清单」就直接放弃（返回空），绝不靠猜。
+/// - 拿不到「已安装应用清单」就直接放弃（返回 nil），绝不靠猜。
 /// - 系统/SDK/更新器/登录助手等一律进否定名单，永不标记。
 /// - UUID / (null) 这类无法解析身份的目录永不标记。
 /// - Group Containers / Application Scripts / LaunchAgents 默认完全不扫（跨应用共享或会改登录行为）。
@@ -51,28 +51,25 @@ enum LeftoverScanner {
     /// lsregister -dump，取 identifier: 行，小写。
     static func lsregisterIDs() -> Set<String> {
         let lsr = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-        guard fm.isExecutableFile(atPath: lsr) else { return [] }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: lsr)
-        p.arguments = ["-dump"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice   // stderr 不读，直接丢弃，避免管道写满死锁
-        guard (try? p.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        // 非 0 退出（被 kill / 中途崩溃）→ 视为失败，绝不拿半截清单去判残留
-        guard p.terminationStatus == 0 else { return [] }
+        // 非 0 退出（超时被杀 / 中途崩溃）→ 视为失败，绝不拿半截清单去判残留
+        guard let result = runProcess(lsr, ["-dump"], timeout: 60), result.status == 0 else { return [] }
+        let ids = parseIdentifiers(String(decoding: result.output, as: UTF8.self))
+        // 健康的 Mac 会注册成百上千个 id；过少说明 dump 不完整 → 放弃
+        return ids.count >= 50 ? ids : []
+    }
+
+    /// dump 有几十万行，只比 UTF-8 字节，不做逐字符的 Unicode 处理。
+    static func parseIdentifiers(_ dump: String) -> Set<String> {
+        let prefix = Array("identifier:".utf8)
         var ids = Set<String>()
-        let text = String(decoding: data, as: UTF8.self)
-        for line in text.split(separator: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            guard t.hasPrefix("identifier:") else { continue }
-            let id = t.dropFirst("identifier:".count).trimmingCharacters(in: .whitespaces).lowercased()
+        for line in dump.utf8.split(separator: UInt8(ascii: "\n")) {
+            let content = line.drop { $0 == UInt8(ascii: " ") || $0 == UInt8(ascii: "\t") }
+            guard content.starts(with: prefix) else { continue }
+            let id = String(Substring(content.dropFirst(prefix.count)))
+                .trimmingCharacters(in: .whitespaces)
+                .lowercased()
             if !id.isEmpty, !id.contains(" ") { ids.insert(id) }
         }
-        // 健康的 Mac 会注册成百上千个 id；过少说明 dump 不完整 → 放弃
-        guard ids.count >= 50 else { return [] }
         return ids
     }
 
@@ -105,43 +102,63 @@ enum LeftoverScanner {
         return bundleIdRegex.firstMatch(in: s, range: r) != nil
     }
 
-    /// 大小写无关 + 双向父子前缀匹配 + 共享产品祖先（消除已安装应用的 helper/子组件误判）
-    static func isInstalled(_ id: String, _ installed: Set<String>) -> Bool {
-        let l = id.lowercased()
-        if installed.contains(l) { return true }
-        for inst in installed {
-            if inst.hasPrefix(l + ".") || l.hasPrefix(inst + ".") { return true }
-        }
-        return sharesProductAncestor(l, installed)
-    }
-
     /// 已知的「多租户」根（不同主体共用一个前缀，不能当作同一厂商）
     static let multiTenantRoots: Set<String> = [
         "jp.co", "io.github", "com.github", "com.googlecode",
         "net.sourceforge", "io.gitlab", "org.eclipse",
     ]
 
-    /// 放宽匹配，消除「同一应用/同一厂商」的残留误判。方向上宁可漏判，绝不误删活数据：
-    /// - ≥4 段子组件：取前 3 段「厂商.产品」做祖先匹配（com.bjango.istatmenus6.extras）
-    /// - 任意 ≥3 段：取前 2 段「根.厂商」，仅当它是单租户根且该厂商有应用已安装时也算已安装。
-    ///   例：com.ugreen.desktop 是已安装的 UGREEN 应用写入的数据，厂商 com.ugreen 下有已安装 id → 不标记。
-    static func sharesProductAncestor(_ lowercasedID: String, _ installed: Set<String>) -> Bool {
-        let parts = lowercasedID.split(separator: ".")
-        guard parts.count >= 3 else { return false }
-        if parts.count >= 4 {
-            let ancestor = parts.prefix(3).joined(separator: ".")
-            if installed.contains(where: { $0 == ancestor || $0.hasPrefix(ancestor + ".") }) { return true }
+    /// 已安装清单的索引。预先算好每个 id 的所有上级前缀，判定时只查哈希表，
+    /// 不用拿每个候选和上千个已安装 id 逐个比前缀。
+    struct InstalledIndex {
+        let ids: Set<String>
+        /// 某个已安装 id 的上级前缀：com.foo.bar → com、com.foo
+        private let ancestors: Set<String>
+
+        init(_ ids: Set<String>) {
+            self.ids = ids
+            var ancestors = Set<String>()
+            for id in ids {
+                var current = Substring(id)
+                while let dot = current.lastIndex(of: ".") {
+                    current = current[..<dot]
+                    ancestors.insert(String(current))
+                }
+            }
+            self.ancestors = ancestors
         }
-        let vendor = parts.prefix(2).joined(separator: ".")
-        if !multiTenantRoots.contains(vendor),
-           installed.contains(where: { $0.hasPrefix(vendor + ".") }) { return true }
-        return false
+
+        /// 大小写无关 + 双向父子前缀匹配 + 共享产品祖先（消除已安装应用的 helper/子组件误判）。
+        /// 方向上宁可漏判，绝不误删活数据：
+        /// - ≥4 段子组件：取前 3 段「厂商.产品」做祖先匹配（com.bjango.istatmenus6.extras）
+        /// - 任意 ≥3 段：取前 2 段「根.厂商」，仅当它是单租户根且该厂商有应用已安装时也算已安装。
+        ///   例：com.ugreen.desktop 是已安装的 UGREEN 应用写入的数据，厂商 com.ugreen 下有已安装 id → 不标记。
+        func contains(_ id: String) -> Bool {
+            let l = id.lowercased()
+            if ids.contains(l) || ancestors.contains(l) { return true }
+
+            var current = Substring(l)
+            while let dot = current.lastIndex(of: ".") {
+                current = current[..<dot]
+                if ids.contains(String(current)) { return true }
+            }
+
+            let parts = l.split(separator: ".")
+            guard parts.count >= 3 else { return false }
+            if parts.count >= 4 {
+                let product = parts.prefix(3).joined(separator: ".")
+                if ids.contains(product) || ancestors.contains(product) { return true }
+            }
+            let vendor = parts.prefix(2).joined(separator: ".")
+            return !multiTenantRoots.contains(vendor) && ancestors.contains(vendor)
+        }
     }
 
-    /// 返回候选残留的 URL 列表。已安装清单为空 → 返回空（放弃）。
-    static func candidateURLs() -> [URL] {
+    /// 返回候选残留的 URL 列表。拿不到已安装清单 → 返回 nil（放弃），让界面如实告知，而不是显示「很干净」。
+    static func candidateURLs() -> [URL]? {
         let installed = installedBundleIDs()
-        guard !installed.isEmpty else { return [] }   // 硬性放弃：绝不在没有可靠清单时乱猜
+        guard !installed.isEmpty else { return nil }   // 硬性放弃：绝不在没有可靠清单时乱猜
+        let index = InstalledIndex(installed)
 
         // 保守目录集合：刻意不含 Group Containers / Application Scripts / LaunchAgents
         let dirs: [(sub: String, suffix: String?)] = [
@@ -154,7 +171,6 @@ enum LeftoverScanner {
         ]
 
         var out: [URL] = []
-        var seen = Set<String>()   // 同一 bundle id 在多个目录都有残留时，避免重复列同名（仍按 URL 区分）
         for (sub, suffix) in dirs {
             let base = home.appendingPathComponent(sub)
             let kids = (try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
@@ -165,9 +181,8 @@ enum LeftoverScanner {
                 var name = raw
                 if let s = suffix, name.hasSuffix(s) { name.removeLast(s.count) }
                 guard looksLikeBundleID(name), !isDenied(name) else { continue }
-                guard !isInstalled(name, installed) else { continue }
-                let key = url.path
-                if seen.insert(key).inserted { out.append(url) }
+                guard !index.contains(name) else { continue }
+                out.append(url)
             }
         }
         return out

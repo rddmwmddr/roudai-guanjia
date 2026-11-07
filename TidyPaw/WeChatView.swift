@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import QuickLookUI
 
 // MARK: - 引擎
 
@@ -8,13 +7,17 @@ import QuickLookUI
 final class WeChatEngine: ObservableObject {
     enum State: Equatable { case idle, scanning, loaded, needsAccess, notInstalled }
     @Published private(set) var state: State = .idle
-    @Published private(set) var result: WeChatResult?
+    @Published private(set) var result: WeChatResult? {
+        didSet { rowCache = nil }
+    }
+
+    private var rowCache: (drill: WCDrill, key: WCSortKey, ascending: Bool, rows: [WeChatRow])?
 
     func scan() {
         guard state != .scanning else { return }
+        state = .scanning   // 同步置位，连点两下不会启动两次
         Task { @MainActor in
-            state = .scanning
-            let probe = WeChatScanner.probe()
+            let probe = await Task.detached(priority: .userInitiated) { WeChatScanner.probe() }.value
             if probe.roots.isEmpty { state = .notInstalled; return }
             if !probe.readable { state = .needsAccess; return }
             let r = await Task.detached(priority: .userInitiated) { WeChatScanner.scan() }.value
@@ -22,6 +25,39 @@ final class WeChatEngine: ObservableObject {
             state = (r.total == 0 && r.unreadable > 0) ? .needsAccess : .loaded
         }
     }
+
+    /// 下钻后的文件列表。结果会缓存：打开预览等无关的界面刷新，不该让几千个文件名重新排序。
+    func rows(for drill: WCDrill, key: WCSortKey, ascending: Bool) -> [WeChatRow] {
+        if let c = rowCache, c.drill == drill, c.key == key, c.ascending == ascending { return c.rows }
+        let buckets = (result?.buckets ?? []).filter { bucket in
+            if case .category(let label) = drill { return bucket.label == label }
+            return true
+        }
+        let rows = buckets.flatMap { b in b.files.map { WeChatRow(file: $0, category: b.label) } }
+        var sorted: [WeChatRow]
+        switch key {
+        case .size: sorted = rows.sorted { $0.file.size < $1.file.size }
+        case .date: sorted = rows.sorted { $0.file.modified < $1.file.modified }
+        case .name:
+            sorted = rows.map { ($0, $0.file.name) }
+                .sorted { $0.1.localizedStandardCompare($1.1) == .orderedAscending }
+                .map { $0.0 }
+        case .category:
+            sorted = rows.sorted { a, b in
+                if a.category != b.category { return a.category.localizedStandardCompare(b.category) == .orderedAscending }
+                return a.file.size < b.file.size
+            }
+        }
+        if !ascending { sorted.reverse() }
+        rowCache = (drill, key, ascending, sorted)
+        return sorted
+    }
+}
+
+struct WeChatRow: Identifiable {
+    let file: WeChatFile
+    let category: String
+    var id: UUID { file.id }
 }
 
 // MARK: - 界面
@@ -30,7 +66,7 @@ struct WeChatView: View {
     @ObservedObject var engine: WeChatEngine
     @State private var drill: WCDrill?               // nil=分类总览；.category/.all=进入文件列表
     @State private var sortKey: WCSortKey = .size    // 文件列表排序：大小/名称/日期/分类
-    @State private var sortAsc = false               // 升/降序（不同键有不同默认方向，见 sortControl）
+    @State private var sortAsc = false               // 升/降序（名称/分类默认升序，大小/日期默认降序）
     @State private var previewItem: FilePreviewItem?  // 应用内预览的文件（sheet）
 
     var body: some View {
@@ -45,6 +81,7 @@ struct WeChatView: View {
         }
         // 应用内 Quick Look 预览（共用 FilePreview.swift 的内嵌 QLPreviewView sheet）
         .filePreview($previewItem)
+        .onValueChange(of: sortKey) { sortAsc = ($0 == .name || $0 == .category) }
     }
 
     private var header: some View {
@@ -101,11 +138,11 @@ struct WeChatView: View {
                 switch drill {
                 case .all:
                     fileListView(title: "全部文件", count: r.buckets.reduce(0) { $0 + $1.count },
-                                 size: r.total, files: allFiles(r), showCategory: true)
+                                 size: r.total, drill: .all, showCategory: true)
                 case .category(let label):
                     if let b = r.buckets.first(where: { $0.label == label }) {
                         fileListView(title: b.label, count: b.count, size: b.size,
-                                     files: b.files.map { ($0, b.label) }, showCategory: false)
+                                     drill: .category(label), showCategory: false)
                     } else {
                         resultView(r)   // 重扫后该分类不存在了 → 回总览
                     }
@@ -114,10 +151,6 @@ struct WeChatView: View {
                 }
             }
         }
-    }
-
-    private func allFiles(_ r: WeChatResult) -> [(WeChatFile, String)] {
-        r.buckets.flatMap { b in b.files.map { ($0, b.label) } }
     }
 
     private func resultView(_ r: WeChatResult) -> some View {
@@ -200,14 +233,15 @@ struct WeChatView: View {
     // MARK: 某一类的文件列表（点进来）
 
     private func fileListView(title: String, count: Int, size: Int64,
-                              files: [(WeChatFile, String)], showCategory: Bool) -> some View {
-        let sorted = sortedFiles(files)
+                              drill listDrill: WCDrill, showCategory: Bool) -> some View {
+        let rows = engine.rows(for: listDrill, key: sortKey, ascending: sortAsc)
         return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Button { drill = nil } label: { Label("返回", systemImage: "chevron.left") }
                     .buttonStyle(.link)
                 Spacer()
-                sortControl
+                SortBar(options: [("大小", .size), ("名称", .name), ("日期", .date), ("分类", .category)],
+                        key: $sortKey, ascending: $sortAsc)
             }
             HStack(spacing: 8) {
                 Image(systemName: showCategory ? "square.grid.2x2.fill" : icon(title))
@@ -216,13 +250,13 @@ struct WeChatView: View {
                 Text("· 共 \(count) 个 · \(formatBytes(size))").font(.callout).foregroundStyle(.secondary)
                 Spacer()
             }
-            if count > files.count {
-                Text("文件较多，只列出最大的 \(files.count) 个（按当前排序展示）。")
+            if count > rows.count {
+                Text("文件较多，只列出最大的 \(rows.count) 个（按当前排序展示）。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             LazyVStack(spacing: 6) {
-                ForEach(sorted, id: \.0.id) { item in
-                    fileRow(item.0, category: item.1, showCategory: showCategory)
+                ForEach(rows) { row in
+                    fileRow(row.file, category: row.category, showCategory: showCategory)
                 }
             }
             Text("只读：👁 应用内预览，🔍 在访达中定位；肉呆大管家不会替你删微信数据。")
@@ -230,43 +264,6 @@ struct WeChatView: View {
         }
         .padding(20).frame(maxWidth: 760)
         .frame(maxWidth: .infinity)
-    }
-
-    private var sortControl: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.up.arrow.down").font(.caption).foregroundStyle(.secondary)
-            Picker("排序", selection: $sortKey) {
-                Text("大小").tag(WCSortKey.size)
-                Text("名称").tag(WCSortKey.name)
-                Text("日期").tag(WCSortKey.date)
-                Text("分类").tag(WCSortKey.category)
-            }
-            .labelsHidden().pickerStyle(.menu).fixedSize()
-            Button { sortAsc.toggle() } label: {
-                Image(systemName: sortAsc ? "arrow.up" : "arrow.down")
-            }
-            .buttonStyle(.borderless)
-            .help(sortAsc ? "升序" : "降序")
-        }
-        .onValueChange(of: sortKey) { key in
-            sortAsc = (key == .name || key == .category)   // 名称/分类默认升序；大小/日期默认降序
-        }
-    }
-
-    private func sortedFiles(_ files: [(WeChatFile, String)]) -> [(WeChatFile, String)] {
-        var s = files
-        switch sortKey {
-        case .size: s.sort { $0.0.size < $1.0.size }
-        case .name: s.sort { $0.0.name.localizedStandardCompare($1.0.name) == .orderedAscending }
-        case .date: s.sort { $0.0.modified < $1.0.modified }
-        case .category:
-            s.sort { a, b in
-                if a.1 != b.1 { return a.1.localizedStandardCompare(b.1) == .orderedAscending }
-                return a.0.size < b.0.size
-            }
-        }
-        if !sortAsc { s.reverse() }
-        return s
     }
 
     private func fileRow(_ f: WeChatFile, category: String, showCategory: Bool) -> some View {
