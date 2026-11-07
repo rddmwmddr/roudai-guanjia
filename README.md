@@ -2,9 +2,9 @@
 
 <h1 align="center">肉呆大管家</h1>
 
-<p align="center">原生 macOS 系统管家：清理磁盘，连同残留卸载 App，查看每个 App 拿到的权限和后台活动。</p>
+<p align="center">原生 macOS 系统管家：清理磁盘，连同残留卸载 App，把安卓手机的照片传到 Mac，查看每个 App 拿到的权限和后台活动。</p>
 
-<p align="center"><b><a href="https://github.com/rddmwmddr/roudai-guanjia/releases/latest/download/RouDaiGuanJia.dmg">下载最新版（.dmg）</a></b></p>
+<p align="center"><b><a href="https://github.com/rddmwmddr/roudai-guanjia/releases/latest/download/RouDaiGuanJia.dmg">下载最新版（.dmg）</a></b> · <a href="https://ahuamiao.com/sites/other/roudai-tools.html">官网和国内下载</a></p>
 
 <p align="center">macOS 13 及以上 · Apple 芯片和 Intel 通用 · 已通过 Apple 公证 · 不联网</p>
 
@@ -133,6 +133,26 @@
 
 比如想知道微信占的空间里视频有多少、最大的文件是哪些，再决定要不要在微信里清理。
 
+### 手机传图
+
+把安卓手机的照片和视频传到 Mac 指定的文件夹，手机上的文件不动。
+
+**特点**
+
+- 两种连接方式：手机选「文件传输」走 MTP，不用装任何东西；开启 USB 调试并安装 adb 后走 adb，速度更快。同一台手机两种都开时用 adb。
+- 只读 DCIM、Pictures、Movies 里的照片和视频，跳过隐藏目录，可以按相册、时间、照片或视频筛选。
+- 同名同大小的文件算传过，不重复传。同名不同大小的文件改名保存，不覆盖已有文件。
+- 照片的文件日期写成拍摄时间，放进访达按日期排序时顺序正确。
+- 文件夹按「手机 / 相册」「手机 / 年-月」或不分文件夹整理。多台手机可以一起传。
+- 通过无线调试连接的手机默认不传，要手动打开它的开关。
+- 只在打开这一页时连接手机。离开后如果还在传，侧边栏显示进度，传完断开。中途退出 App 时，没传完的文件会被清掉。
+
+**好处**
+
+比如拍了一天的照片，插上线点一次「开始传输」，第二天接着拍，再传时只传新拍的。
+
+![手机传图](docs/screenshots/phone.png)
+
 ### 深色模式和液态玻璃
 
 在 macOS 26 及以上使用液态玻璃，旧系统回退到系统材质。深色和浅色跟随系统。
@@ -152,6 +172,7 @@
 | 用户缓存、应用日志、Xcode、卸载残留 | 不必须，授权后结果更完整 |
 | 下载旧文件、大文件、重复文件 | 不必须，首次扫描时系统会询问桌面、文稿、下载的访问权限 |
 | 拖拽卸载、系统透视 | 不必须 |
+| 手机传图 | 不必须，用文件传输模式时系统会询问相机权限，点「允许」 |
 
 ## 使用教程
 
@@ -172,6 +193,16 @@
 5. App 在运行时，按提示退出它们。列表里有系统级项目时，按提示输入一次管理员密码。
 
 要恢复时，到废纸篓里把文件「放回」。经管理员权限移动的项目不支持「放回」，要手动移回原位置。
+
+### 把手机照片传到 Mac
+
+1. 用 USB 线连接手机并解锁，在手机通知栏把 USB 用途改成「文件传输」。
+2. 点侧边栏的「手机传图」。系统询问相机权限时点「允许」，这个权限用来读取手机相册。
+3. 点「更改…」选择保存的文件夹，在下面选整理方式、照片或视频、时间范围。
+4. 在手机卡片里取消不想传的相册。
+5. 点右下角的「开始传输」。
+
+想传得更快：在手机开发者选项里打开「USB 调试」，并在 Mac 上安装 [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools)（放到 `~/platform-tools/` 或用 Homebrew 安装），手机弹窗询问时点「允许」。
 
 ### 查看权限
 
@@ -204,7 +235,7 @@
 
 ## 测试情况
 
-这一版在 macOS 27（Apple 芯片）上测试。Intel 机型和 macOS 13—25 编译通过，没有上机测试。遇到问题请提 [Issue](https://github.com/rddmwmddr/roudai-guanjia/issues)。
+这一版在 macOS 27（Apple 芯片）上测试。Intel 机型和 macOS 13—25 编译通过，没有上机测试。手机传图的 adb 通道用真机传过，文件传输（MTP）通道这一版还没有真机验证。遇到问题请提 [Issue](https://github.com/rddmwmddr/roudai-guanjia/issues)。
 
 ## 从源码构建
 
@@ -229,6 +260,7 @@ TidyPaw/
 ├── PermissionsScanner.swift # 只读 TCC 数据库
 ├── PrivacyScanners.swift    # 网络、磁盘读写、自启、蓝牙、电池
 ├── WeChatScanner.swift      # 微信数据统计
+├── PhoneTransfer*.swift     # 手机传图：adb 和 MTP 两种通道、传输计划
 ├── SystemCommand.swift      # 跑系统命令（带超时）
 └── *View.swift              # 界面
 Tests/                       # 回归测试

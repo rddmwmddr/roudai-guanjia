@@ -132,6 +132,118 @@ check("共用路径只归在先加入的 App 名下", merged[0].count == 2 && me
 let nested = UninstallEngine.topLevel([candidate("Applications/A.app"), candidate("Applications/A.app/Contents/Inner.app"), candidate("Applications/AB.app")])
 check("App 包里的项目不单独搬，前缀相同的兄弟不受影响", nested.map(\.url.lastPathComponent) == ["A.app", "AB.app"], "\(nested.map(\.url.lastPathComponent))")
 
+section("手机传图：识别媒体和相册")
+check("jpg、heic、mp4 能识别", PhoneMedia.kind(for: "A.JPG") == .photo && PhoneMedia.kind(for: "a.heic") == .photo && PhoneMedia.kind(for: "a.mp4") == .video)
+check("其他文件不传", PhoneMedia.kind(for: "a.txt") == nil && PhoneMedia.kind(for: "a") == nil)
+check("DCIM/Camera 相册名是 Camera", PhoneMedia.albumName(forFolders: ["sdcard", "DCIM", "Camera"]) == "Camera")
+check("直接放在 DCIM 下，相册名是 DCIM", PhoneMedia.albumName(forFolders: ["sdcard", "DCIM"]) == "DCIM")
+check("多层相册保留层级", PhoneMedia.albumName(forFolders: ["sdcard", "Pictures", "微信", "2026"]) == "微信/2026")
+check("隐藏目录不传", PhoneMedia.albumName(forFolders: ["sdcard", "DCIM", ".thumbnails"]) == nil)
+check("不在三个目录下不传", PhoneMedia.albumName(forFolders: ["sdcard", "Download"]) == nil)
+check("手机上的 .. 不能跑出保存目录", PhoneMedia.albumName(forFolders: ["DCIM", ".."]) == nil)
+check("带斜杠的文件夹名不能跑出保存目录", PhoneMedia.albumName(forFolders: ["DCIM", "a/../../x"]) == nil)
+check("带斜杠的文件名不可用", !PhoneMedia.isUsableName("../x.jpg") && !PhoneMedia.isUsableName(".hidden.jpg") && PhoneMedia.isUsableName("IMG_1.jpg"))
+
+let scanned = PhoneMedia.parseScan("""
+1024|1760000000|/sdcard/DCIM/Camera/IMG_1.jpg
+2048|1760000100|/sdcard/DCIM/Camera/a|b.mp4
+10|1760000000|/sdcard/DCIM/.thumbnails/x.jpg
+10|1760000000|/sdcard/DCIM/Camera/.pending.jpg
+10|1760000000|/sdcard/DCIM/Camera/note.txt
+oops
+abc|def|/sdcard/DCIM/Camera/bad.jpg
+""")
+check("解析 adb 扫描结果，跳过隐藏和无关文件", scanned.map(\.name) == ["IMG_1.jpg", "a|b.mp4"], "\(scanned.map(\.name))")
+check("文件名里的 | 不影响解析", scanned.last?.id == "/sdcard/DCIM/Camera/a|b.mp4" && scanned.last?.size == 2048)
+
+section("手机传图：分批")
+func planned(_ name: String, dir: String = "A", size: Int64 = 1, as fileName: String? = nil) -> PhonePlannedItem {
+    PhonePlannedItem(item: PhoneMediaItem(id: "/sdcard/\(name)", name: name, album: "Camera", size: size, date: Date(), kind: .photo),
+                     dir: path(dir), fileName: fileName ?? name)
+}
+var batches = PhoneDevice.makeBatches((0..<250).map { planned("\($0).jpg") })
+check("每批最多 100 个", batches.map(\.count) == [100, 100, 50], "\(batches.map(\.count))")
+batches = PhoneDevice.makeBatches([planned("a.jpg"), planned("b.jpg", dir: "B"), planned("c.jpg", dir: "B")])
+check("不同文件夹分开", batches.map(\.count) == [1, 2])
+batches = PhoneDevice.makeBatches([planned("a.jpg"), planned("b.jpg", as: "b_1.jpg"), planned("c.jpg")])
+check("要改名的单独一批", batches.map(\.count) == [1, 1, 1])
+batches = PhoneDevice.makeBatches([planned("a.jpg", size: 1_000_000_000), planned("b.jpg")])
+check("超过 1 GB 换一批", batches.map(\.count) == [1, 1])
+
+section("手机传图：传输计划")
+MainActor.assumeIsolated {
+    let manager = PhoneManager()
+    let settings = manager.settings
+    settings.destPath = path("PhoneDest").path
+    func item(_ name: String, album: String = "Camera", size: Int64 = 100, days: Double = 1, kind: PhoneMediaKind = .photo) -> PhoneMediaItem {
+        PhoneMediaItem(id: "/sdcard/DCIM/\(album)/\(name)", name: name, album: album, size: size,
+                       date: Date().addingTimeInterval(-days * 86_400), kind: kind)
+    }
+    @MainActor func makeDevice(_ serial: String, model: String = "Test Phone", _ items: [PhoneMediaItem]) -> PhoneDevice {
+        let device = PhoneDevice(id: serial, backend: .adb, serial: serial, model: model, manager: manager)
+        device.setItems(items)
+        device.state = .ready
+        return device
+    }
+    @MainActor func compute(_ devices: PhoneDevice...) {
+        var taken = Set<String>()
+        var cache = PhoneDirCache()
+        for device in devices { device.computePlan(settings, taken: &taken, cache: &cache) }
+    }
+
+    settings.layout = .deviceAlbum
+    let phone = makeDevice("USB1", [item("a.jpg"), item("b.jpg"), item("c.mp4", kind: .video), item("x.jpg", album: "微信")])
+    compute(phone)
+    check("新文件全部进计划", phone.plan.count == 4 && phone.planBytes == 400 && phone.skipped == 0)
+    check("按 手机/相册 放", phone.plan.contains { $0.url.path.hasSuffix("PhoneDest/Test Phone/微信/x.jpg") })
+    check("相册按 Camera 优先", phone.albums.first?.name == "Camera" && phone.albums.count == 2)
+
+    let camera = path("PhoneDest/Test Phone/Camera"); mkdir(camera)
+    write(camera.appendingPathComponent("a.jpg"), bytes: 100)            // 同名同大小：传过了
+    write(camera.appendingPathComponent("b.jpg"), bytes: 50)             // 同名不同大小：另一个文件
+    compute(phone)
+    check("同名同大小跳过", phone.skipped == 1 && !phone.plan.contains { $0.fileName == "a.jpg" })
+    check("同名不同大小改名，不覆盖", phone.plan.contains { $0.fileName == "b_1.jpg" } && !phone.plan.contains { $0.fileName == "b.jpg" })
+
+    phone.excludedAlbums = ["微信"]
+    compute(phone)
+    check("排除的相册不传", !phone.plan.contains { $0.item.album == "微信" })
+    phone.excludedAlbums = []
+    settings.videos = false
+    compute(phone)
+    check("关掉视频不传视频", !phone.plan.contains { $0.item.kind == .video })
+    settings.videos = true; settings.photos = false
+    compute(phone)
+    check("关掉照片只传视频", phone.plan.allSatisfy { $0.item.kind == .video })
+    settings.photos = true
+
+    let old = makeDevice("USB2", [item("old.jpg", days: 40), item("new.jpg", days: 2)])
+    settings.range = .month
+    compute(old)
+    check("时间范围生效", old.plan.map(\.fileName) == ["new.jpg"], "\(old.plan.map(\.fileName))")
+    settings.range = .all
+
+    settings.layout = .flat
+    settings.destPath = path("PhoneFlat").path
+    let one = makeDevice("USB3", model: "A", [item("same.jpg")])
+    let two = makeDevice("USB4", model: "B", [item("same.jpg")])
+    compute(one, two)
+    check("不分文件夹时两台同名文件不撞车", one.plan.first?.fileName == "same.jpg" && two.plan.first?.fileName == "same_1.jpg", "\(two.plan.map(\.fileName))")
+    settings.layout = .deviceMonth
+    compute(one)
+    check("按年-月放", one.plan.first?.dir.lastPathComponent.range(of: "^[0-9]{4}-[0-9]{2}$", options: .regularExpression) != nil)
+    settings.layout = .deviceAlbum
+
+    let hostile = makeDevice("USB5", model: "..", [item("a.jpg")])
+    check("手机型号是 .. 时不跑出保存目录", hostile.folderName == "手机")
+    let slash = makeDevice("USB6", model: "a/b:c", [item("a.jpg")])
+    check("型号里的斜杠和冒号换掉", slash.folderName == "a-b-c")
+
+    check("USB 手机默认传", makeDevice("06078460499C3540", []).enabled)
+    check("无线调试的手机默认不传", !makeDevice("adb-4fed5a44-9RGIBY._adb-tls-connect._tcp", []).enabled && !makeDevice("192.168.0.5:5555", []).enabled)
+    check("无线连接有标注", makeDevice("192.168.0.5:5555", []).channelLabel == "无线调试")
+}
+
 // MARK: - 路径保护
 
 section("路径保护")

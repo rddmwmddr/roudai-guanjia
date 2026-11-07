@@ -13,7 +13,8 @@ xcrun swiftc -swift-version 5 -O -o "$WORK/tests" \
     "$SRC/Models.swift" "$SRC/PathSafety.swift" "$SRC/SystemCommand.swift" \
     "$SRC/FileScanner.swift" "$SRC/FileClassifier.swift" "$SRC/LeftoverScanner.swift" \
     "$SRC/ScanEngine.swift" "$SRC/UninstallScanner.swift" "$SRC/UninstallEngine.swift" \
-    "$SRC/WeChatScanner.swift" "$SRC/PrivacyScanners.swift"
+    "$SRC/WeChatScanner.swift" "$SRC/PrivacyScanners.swift" \
+    "$SRC/PhoneTransferCore.swift" "$SRC/PhoneTransferBackends.swift" "$SRC/PhoneTransferManager.swift"
 
 mkdir "$WORK/home"
 CFFIXED_USER_HOME="$WORK/home" "$WORK/tests"
