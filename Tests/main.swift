@@ -240,7 +240,7 @@ MainActor.assumeIsolated {
     check("型号里的斜杠和冒号换掉", slash.folderName == "a-b-c")
 
     check("USB 手机默认传", makeDevice("06078460499C3540", []).enabled)
-    check("无线调试的手机默认不传", !makeDevice("adb-4fed5a44-9RGIBY._adb-tls-connect._tcp", []).enabled && !makeDevice("192.168.0.5:5555", []).enabled)
+    check("无线调试的手机默认不传", !makeDevice("adb-00000000-ABCDEF._adb-tls-connect._tcp", []).enabled && !makeDevice("192.168.0.5:5555", []).enabled)
     check("无线连接有标注", makeDevice("192.168.0.5:5555", []).channelLabel == "无线调试")
 }
 
