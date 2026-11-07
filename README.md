@@ -4,7 +4,7 @@
 
 <p align="center">原生 macOS 系统管家：清理磁盘，连同残留卸载 App，把安卓手机的照片传到 Mac，查看每个 App 拿到的权限和后台活动。</p>
 
-<p align="center"><b><a href="https://github.com/rddmwmddr/roudai-guanjia/releases/latest/download/RouDaiGuanJia.dmg">下载最新版（.dmg）</a></b></p>
+<p align="center"><b><a href="https://github.com/rddmwmddr/roudai-guanjia/releases/latest/download/RouDaiGuanJia.dmg">下载最新版（.dmg）</a></b> · <a href="https://ahuamiao.com/sites/other/roudai-tools.html">官网和国内下载</a></p>
 
 <p align="center">macOS 13 及以上 · Apple 芯片和 Intel 通用 · 已通过 Apple 公证 · 不联网</p>
 
@@ -151,6 +151,8 @@
 
 比如拍了一天的照片，插上线点一次「开始传输」，第二天接着拍，再传时只传新拍的。
 
+![手机传图](docs/screenshots/phone.png)
+
 ### 深色模式和液态玻璃
 
 在 macOS 26 及以上使用液态玻璃，旧系统回退到系统材质。深色和浅色跟随系统。
@@ -233,7 +235,7 @@
 
 ## 测试情况
 
-这一版在 macOS 27（Apple 芯片）上测试。Intel 机型和 macOS 13—25 编译通过，没有上机测试。遇到问题请提 [Issue](https://github.com/rddmwmddr/roudai-guanjia/issues)。
+这一版在 macOS 27（Apple 芯片）上测试。Intel 机型和 macOS 13—25 编译通过，没有上机测试。手机传图的 adb 通道用真机传过，文件传输（MTP）通道这一版还没有真机验证。遇到问题请提 [Issue](https://github.com/rddmwmddr/roudai-guanjia/issues)。
 
 ## 从源码构建
 
