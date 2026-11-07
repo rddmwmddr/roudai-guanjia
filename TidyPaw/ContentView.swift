@@ -7,6 +7,7 @@ enum SidebarItem: Hashable {
     case permissions
     case system
     case wechat
+    case phone
     case category(CategoryKind)
 }
 
@@ -16,12 +17,13 @@ struct ContentView: View {
     @StateObject private var permissions = PermissionsEngine()
     @StateObject private var privacy = PrivacyEngine()
     @StateObject private var wechat = WeChatEngine()
+    @StateObject private var phone = PhoneManager()
     @State private var selection: SidebarItem? = .home
     @State private var showCleanConfirm = false
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(engine: engine, selection: $selection)
+            SidebarView(engine: engine, phone: phone, selection: $selection)
                 .navigationSplitViewColumnWidth(min: 256, ideal: 296, max: 360)
         } detail: {
             detailContent
@@ -31,6 +33,9 @@ struct ContentView: View {
         .tint(Brand.blue)
         .onValueChange(of: selection) { newValue in
             if newValue != .uninstall { uninstall.reset() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            phone.shutdown()
         }
         // 工具栏恒定（首页 / 全部扫描 / 清理），不随选中项增减，避免整窗重排
         .toolbar {
@@ -75,6 +80,8 @@ struct ContentView: View {
             SystemView(engine: privacy)
         case .wechat:
             WeChatView(engine: wechat)
+        case .phone:
+            PhoneTransferView(manager: phone)
         case .category(let kind):
             if let cat = engine.category(kind) {
                 CategoryDetailView(engine: engine, category: cat)
@@ -120,6 +127,7 @@ struct ContentView: View {
 
 struct SidebarView: View {
     @ObservedObject var engine: ScanEngine
+    @ObservedObject var phone: PhoneManager
     @Binding var selection: SidebarItem?
 
     var body: some View {
@@ -140,6 +148,9 @@ struct SidebarView: View {
                 }
                 SidebarRow(selected: selection == .wechat) { selection = .wechat } content: {
                     ToolRowContent(icon: "message", title: "微信管理", subtitle: "聊天记录占用与分类")
+                }
+                SidebarRow(selected: selection == .phone) { selection = .phone } content: {
+                    ToolRowContent(icon: "photo.on.rectangle.angled", title: "手机传图", subtitle: phone.sidebarSubtitle)
                 }
                 ForEach(CategoryGroup.allCases) { group in
                     header(group.rawValue)
