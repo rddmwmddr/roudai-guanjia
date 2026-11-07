@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 其余标准键（CFBundleName/DisplayName/版本/类别等）由 GENERATE_INFOPLIST_FILE 从
+	     INFOPLIST_KEY_* 生成后合并进来，这里只放无法用 INFOPLIST_KEY_ 表达的自定义键。 -->
+	<key>LSEnvironment</key>
+	<dict>
+		<!-- 规避 Swift 6.3.x + macOS 26/27 上 SwiftUI 悬停命中测试里 MainActor.assumeIsolated
+		     的 swift_task_isCurrentExecutor 误崩溃：回落到非崩溃的 legacy 执行器校验。
+		     经 open/Dock 启动时也生效（scheme 里的环境变量只在 Xcode 运行时生效）。 -->
+		<key>SWIFT_IS_CURRENT_EXECUTOR_LEGACY_MODE_OVERRIDE</key>
+		<string>legacy</string>
+	</dict>
+</dict>
+</plist>
